@@ -1,0 +1,56 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# C/C++ generated files
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# Debug / profiling
+*.dSYM/
+*.gcda
+*.gcno
+*.prof
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Frontend builds
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# Test / benchmark generated output
+coverage/
+benchmark-output/
+
+# Temporary files
+*.tmp
+*.temp
+EOF
