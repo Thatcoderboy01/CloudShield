@@ -2,13 +2,11 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <iostream>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <vector>
 
 namespace {
 
@@ -16,33 +14,20 @@ constexpr int PORT = 8080;
 constexpr int BACKLOG = 10;
 constexpr int MAX_EVENTS = 64;
 
-bool setNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-
-    if (flags == -1) {
-        std::cerr << "fcntl(F_GETFL) failed: "
-                  << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        std::cerr << "fcntl(F_SETFL) failed: "
-                  << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    return true;
-}
-
-void closeClient(std::vector<pollfd>& clients, std::size_t index) {
-    close(clients[index].fd);
-    clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(index));
+void removeClient(int epoll_fd, int client_fd) {
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+    close(client_fd);
 }
 
 }  // namespace
 
 int runTcpServer() {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // 1. Create a non-blocking TCP listening socket.
+    int server_fd = socket(
+        AF_INET,
+        SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+        0
+    );
 
     if (server_fd == -1) {
         std::cerr << "socket() failed: "
@@ -59,6 +44,7 @@ int runTcpServer() {
         return 1;
     }
 
+    // 2. Configure the server address.
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
@@ -80,141 +66,166 @@ int runTcpServer() {
         return 1;
     }
 
-    if (!setNonBlocking(server_fd)) {
+    // 3. Create the epoll instance.
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+
+    if (epoll_fd == -1) {
+        std::cerr << "epoll_create1() failed: "
+                  << std::strerror(errno) << '\n';
         close(server_fd);
         return 1;
     }
 
-    std::vector<pollfd> clients;
-    clients.push_back({server_fd, POLLIN, 0});
+    // 4. Register the listening socket.
+    epoll_event server_event{};
+    server_event.events = EPOLLIN;
+    server_event.data.fd = server_fd;
 
-    std::cout << "CloudShield non-blocking TCP server on port "
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD,
+                  server_fd, &server_event) == -1) {
+        std::cerr << "epoll_ctl() failed: "
+                  << std::strerror(errno) << '\n';
+        close(epoll_fd);
+        close(server_fd);
+        return 1;
+    }
+
+    std::cout << "CloudShield TCP server listening on port "
               << PORT << '\n';
-    std::cout << "Readiness monitoring: poll()\n";
+    std::cout << "Readiness monitoring: epoll\n";
     std::cout << "Press Ctrl+C to stop.\n";
 
-    while (true) {
-        int ready = poll(clients.data(), clients.size(), -1);
+    epoll_event events[MAX_EVENTS];
 
-        if (ready == -1) {
+    // 5. Wait for socket events.
+    while (true) {
+        int count = epoll_wait(
+            epoll_fd, events, MAX_EVENTS, -1
+        );
+
+        if (count == -1) {
             if (errno == EINTR) {
                 continue;
             }
 
-            std::cerr << "poll() failed: "
+            std::cerr << "epoll_wait() failed: "
                       << std::strerror(errno) << '\n';
             break;
         }
 
-        // Accept connections when the listening socket is ready.
-        if (clients[0].revents & POLLIN) {
-            while (true) {
-                sockaddr_in client_addr{};
-                socklen_t client_len = sizeof(client_addr);
+        for (int i = 0; i < count; ++i) {
+            int fd = events[i].data.fd;
+            uint32_t flags = events[i].events;
 
-                int client_fd = accept(
-                    server_fd,
-                    reinterpret_cast<sockaddr*>(&client_addr),
-                    &client_len
-                );
-
-                if (client_fd == -1) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break;
-                    }
-
-                    std::cerr << "accept() failed: "
-                              << std::strerror(errno) << '\n';
-                    break;
+            if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                if (fd != server_fd) {
+                    removeClient(epoll_fd, fd);
                 }
-
-                if (!setNonBlocking(client_fd)) {
-                    close(client_fd);
-                    continue;
-                }
-
-                char ip[INET_ADDRSTRLEN]{};
-                inet_ntop(AF_INET, &client_addr.sin_addr,
-                          ip, sizeof(ip));
-
-                std::cout << "Client connected: " << ip << '\n';
-
-                clients.push_back({client_fd, POLLIN, 0});
-            }
-        }
-
-        // Process ready client sockets.
-        for (std::size_t i = 1; i < clients.size();) {
-            short events = clients[i].revents;
-
-            if (events & (POLLERR | POLLNVAL)) {
-                closeClient(clients, i);
                 continue;
             }
 
-            if (events & (POLLIN | POLLHUP)) {
+            // 6. Accept all pending connections.
+            if (fd == server_fd) {
+                while (true) {
+                    sockaddr_in client_addr{};
+                    socklen_t client_len = sizeof(client_addr);
+
+                    int client_fd = accept4(
+                        server_fd,
+                        reinterpret_cast<sockaddr*>(&client_addr),
+                        &client_len,
+                        SOCK_NONBLOCK | SOCK_CLOEXEC
+                    );
+
+                    if (client_fd == -1) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+
+                        if (errno == EAGAIN ||
+                            errno == EWOULDBLOCK) {
+                            break;
+                        }
+
+                        std::cerr << "accept4() failed: "
+                                  << std::strerror(errno) << '\n';
+                        break;
+                    }
+
+                    epoll_event client_event{};
+                    client_event.events = EPOLLIN | EPOLLRDHUP;
+                    client_event.data.fd = client_fd;
+
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD,
+                                  client_fd, &client_event) == -1) {
+                        std::cerr << "Client registration failed: "
+                                  << std::strerror(errno) << '\n';
+                        close(client_fd);
+                        continue;
+                    }
+
+                    char ip[INET_ADDRSTRLEN]{};
+                    inet_ntop(AF_INET, &client_addr.sin_addr,
+                              ip, sizeof(ip));
+
+                    std::cout << "Client connected: "
+                              << ip << '\n';
+                }
+
+                continue;
+            }
+
+            // 7. Receive data from a ready client.
+            if (flags & EPOLLIN) {
                 char buffer[1024];
 
                 ssize_t received = recv(
-                    clients[i].fd, buffer, sizeof(buffer), 0
+                    fd, buffer, sizeof(buffer), 0
                 );
 
                 if (received > 0) {
-                    std::cout << "Received " << received
-                              << " bytes from client\n";
+                    std::cout << "Received "
+                              << received << " bytes\n";
 
                     const char response[] =
                         "CloudShield TCP server received your message.\n";
 
                     ssize_t sent = send(
-                        clients[i].fd,
-                        response,
-                        sizeof(response) - 1,
+                        fd, response, sizeof(response) - 1,
                         MSG_NOSIGNAL
                     );
 
-                    if (sent == -1 &&
-                        errno != EAGAIN &&
-                        errno != EWOULDBLOCK &&
-                        errno != EINTR) {
+                    if (sent == -1) {
                         std::cerr << "send() failed: "
                                   << std::strerror(errno) << '\n';
-                        closeClient(clients, i);
-                        continue;
+                    } else if (
+                        static_cast<std::size_t>(sent) !=
+                        sizeof(response) - 1
+                    ) {
+                        std::cerr
+                            << "Partial response; output buffering "
+                            << "is not implemented yet.\n";
                     }
 
-                    // This learning version expects small test messages.
-                    // A production server must queue partial writes.
-                    if (sent >= 0 &&
-                        static_cast<std::size_t>(sent) != sizeof(response) - 1) {
-                        std::cerr << "Partial response; closing client\n";
-                        closeClient(clients, i);
-                        continue;
-                    }
+                    // This learning version handles one message
+                    // per client connection.
+                    removeClient(epoll_fd, fd);
                 } else if (received == 0) {
-                    closeClient(clients, i);
-                    continue;
-                } else if (errno != EAGAIN &&
-                           errno != EWOULDBLOCK &&
-                           errno != EINTR) {
+                    removeClient(epoll_fd, fd);
+                } else if (
+                    errno != EAGAIN &&
+                    errno != EWOULDBLOCK &&
+                    errno != EINTR
+                ) {
                     std::cerr << "recv() failed: "
                               << std::strerror(errno) << '\n';
-                    closeClient(clients, i);
-                    continue;
+                    removeClient(epoll_fd, fd);
                 }
             }
-
-            ++i;
         }
     }
 
-    for (const auto& client : clients) {
-        close(client.fd);
-    }
-
-    return 0;
+    close(epoll_fd);
+    close(server_fd);
+    return 1;
 }
