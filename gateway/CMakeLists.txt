@@ -1,5 +1,6 @@
 add_executable(cloudshield
     src/core/main.cpp
+    src/network/tcp_server.cpp
 )
 
 target_include_directories(cloudshield
