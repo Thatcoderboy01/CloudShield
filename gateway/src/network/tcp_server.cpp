@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <string>
+#include <unordered_map>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -14,19 +16,41 @@ constexpr int PORT = 8080;
 constexpr int BACKLOG = 10;
 constexpr int MAX_EVENTS = 64;
 
-void removeClient(int epoll_fd, int client_fd) {
+struct ClientState {
+    std::string output;
+    std::size_t sent = 0;
+};
+
+void removeClient(
+    int epoll_fd,
+    int client_fd,
+    std::unordered_map<int, ClientState>& clients
+) {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
     close(client_fd);
+    clients.erase(client_fd);
+}
+
+bool updateInterest(int epoll_fd, int client_fd, bool want_write) {
+    epoll_event event{};
+    event.events = EPOLLIN | EPOLLRDHUP;
+
+    if (want_write) {
+        event.events |= EPOLLOUT;
+    }
+
+    event.data.fd = client_fd;
+
+    return epoll_ctl(
+        epoll_fd, EPOLL_CTL_MOD, client_fd, &event
+    ) != -1;
 }
 
 }  // namespace
 
 int runTcpServer() {
-    // 1. Create a non-blocking TCP listening socket.
     int server_fd = socket(
-        AF_INET,
-        SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-        0
+        AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0
     );
 
     if (server_fd == -1) {
@@ -44,7 +68,6 @@ int runTcpServer() {
         return 1;
     }
 
-    // 2. Configure the server address.
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
@@ -66,7 +89,6 @@ int runTcpServer() {
         return 1;
     }
 
-    // 3. Create the epoll instance.
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 
     if (epoll_fd == -1) {
@@ -76,7 +98,6 @@ int runTcpServer() {
         return 1;
     }
 
-    // 4. Register the listening socket.
     epoll_event server_event{};
     server_event.events = EPOLLIN;
     server_event.data.fd = server_fd;
@@ -90,14 +111,16 @@ int runTcpServer() {
         return 1;
     }
 
+    std::unordered_map<int, ClientState> clients;
+
     std::cout << "CloudShield TCP server listening on port "
               << PORT << '\n';
     std::cout << "Readiness monitoring: epoll\n";
+    std::cout << "Output buffering: enabled\n";
     std::cout << "Press Ctrl+C to stop.\n";
 
     epoll_event events[MAX_EVENTS];
 
-    // 5. Wait for socket events.
     while (true) {
         int count = epoll_wait(
             epoll_fd, events, MAX_EVENTS, -1
@@ -117,15 +140,16 @@ int runTcpServer() {
             int fd = events[i].data.fd;
             uint32_t flags = events[i].events;
 
-            if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                if (fd != server_fd) {
-                    removeClient(epoll_fd, fd);
-                }
-                continue;
-            }
-
-            // 6. Accept all pending connections.
             if (fd == server_fd) {
+                if (flags & (EPOLLERR | EPOLLHUP)) {
+                    std::cerr << "Listening socket error\n";
+                    goto shutdown;
+                }
+
+                if (!(flags & EPOLLIN)) {
+                    continue;
+                }
+
                 while (true) {
                     sockaddr_in client_addr{};
                     socklen_t client_len = sizeof(client_addr);
@@ -141,7 +165,6 @@ int runTcpServer() {
                         if (errno == EINTR) {
                             continue;
                         }
-
                         if (errno == EAGAIN ||
                             errno == EWOULDBLOCK) {
                             break;
@@ -164,6 +187,8 @@ int runTcpServer() {
                         continue;
                     }
 
+                    clients.try_emplace(client_fd);
+
                     char ip[INET_ADDRSTRLEN]{};
                     inet_ntop(AF_INET, &client_addr.sin_addr,
                               ip, sizeof(ip));
@@ -175,10 +200,21 @@ int runTcpServer() {
                 continue;
             }
 
-            // 7. Receive data from a ready client.
+            auto it = clients.find(fd);
+            if (it == clients.end()) {
+                continue;
+            }
+
+            if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                removeClient(epoll_fd, fd, clients);
+                continue;
+            }
+
+            ClientState& client = it->second;
+            bool close_connection = false;
+
             if (flags & EPOLLIN) {
                 char buffer[1024];
-
                 ssize_t received = recv(
                     fd, buffer, sizeof(buffer), 0
                 );
@@ -187,42 +223,110 @@ int runTcpServer() {
                     std::cout << "Received "
                               << received << " bytes\n";
 
-                    const char response[] =
+                    client.output =
                         "CloudShield TCP server received your message.\n";
+                    client.sent = 0;
 
+                    // Try sending immediately. If the socket is
+                    // not writable, EPOLLOUT will resume later.
+                    while (client.sent < client.output.size()) {
+                        ssize_t sent = send(
+                            fd,
+                            client.output.data() + client.sent,
+                            client.output.size() - client.sent,
+                            MSG_NOSIGNAL
+                        );
+
+                        if (sent > 0) {
+                            client.sent +=
+                                static_cast<std::size_t>(sent);
+                            continue;
+                        }
+
+                        if (sent == -1 && errno == EINTR) {
+                            continue;
+                        }
+
+                        if (sent == -1 &&
+                            (errno == EAGAIN ||
+                             errno == EWOULDBLOCK)) {
+                            break;
+                        }
+
+                        std::cerr << "send() failed: "
+                                  << std::strerror(errno) << '\n';
+                        close_connection = true;
+                        break;
+                    }
+
+                    if (!close_connection &&
+                        client.sent == client.output.size()) {
+                        close_connection = true;
+                    } else if (!close_connection) {
+                        if (!updateInterest(epoll_fd, fd, true)) {
+                            std::cerr << "Failed to enable EPOLLOUT: "
+                                      << std::strerror(errno) << '\n';
+                            close_connection = true;
+                        }
+                    }
+                } else if (received == 0) {
+                    close_connection = true;
+                } else if (errno != EAGAIN &&
+                           errno != EWOULDBLOCK &&
+                           errno != EINTR) {
+                    std::cerr << "recv() failed: "
+                              << std::strerror(errno) << '\n';
+                    close_connection = true;
+                }
+            }
+
+            if (!close_connection && (flags & EPOLLOUT)) {
+                while (client.sent < client.output.size()) {
                     ssize_t sent = send(
-                        fd, response, sizeof(response) - 1,
+                        fd,
+                        client.output.data() + client.sent,
+                        client.output.size() - client.sent,
                         MSG_NOSIGNAL
                     );
 
-                    if (sent == -1) {
-                        std::cerr << "send() failed: "
-                                  << std::strerror(errno) << '\n';
-                    } else if (
-                        static_cast<std::size_t>(sent) !=
-                        sizeof(response) - 1
-                    ) {
-                        std::cerr
-                            << "Partial response; output buffering "
-                            << "is not implemented yet.\n";
+                    if (sent > 0) {
+                        client.sent +=
+                            static_cast<std::size_t>(sent);
+                        continue;
                     }
 
-                    // This learning version handles one message
-                    // per client connection.
-                    removeClient(epoll_fd, fd);
-                } else if (received == 0) {
-                    removeClient(epoll_fd, fd);
-                } else if (
-                    errno != EAGAIN &&
-                    errno != EWOULDBLOCK &&
-                    errno != EINTR
-                ) {
-                    std::cerr << "recv() failed: "
+                    if (sent == -1 && errno == EINTR) {
+                        continue;
+                    }
+
+                    if (sent == -1 &&
+                        (errno == EAGAIN ||
+                         errno == EWOULDBLOCK)) {
+                        break;
+                    }
+
+                    std::cerr << "send() failed: "
                               << std::strerror(errno) << '\n';
-                    removeClient(epoll_fd, fd);
+                    close_connection = true;
+                    break;
+                }
+
+                if (!close_connection &&
+                    client.sent == client.output.size()) {
+                    close_connection = true;
                 }
             }
+
+            if (close_connection) {
+                removeClient(epoll_fd, fd, clients);
+            }
         }
+    }
+
+shutdown:
+    for (const auto& [fd, state] : clients) {
+        (void)state;
+        close(fd);
     }
 
     close(epoll_fd);
