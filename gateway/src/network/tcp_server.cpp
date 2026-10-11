@@ -1,5 +1,6 @@
 
 #include "network/tcp_server.hpp"
+#include "http/http_request.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -7,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <sys/epoll.h>
@@ -22,11 +24,51 @@ constexpr int MAX_EVENTS = 64;
 constexpr std::size_t MAX_INPUT_BYTES = 4096;
 
 struct ClientState {
+    std::string input;
     std::string output;
+
     std::size_t sent = 0;
-    std::size_t received_bytes = 0;
     bool read_closed = false;
+    bool response_ready = false;
 };
+
+std::string makeHttpResponse(
+    int status,
+    std::string_view reason,
+    std::string_view body
+) {
+    std::string response;
+
+    response.reserve(256 + body.size());
+
+    response += "HTTP/1.1 ";
+    response += std::to_string(status);
+    response += " ";
+    response += reason;
+    response += "\r\n";
+
+    response += "Content-Type: text/plain; charset=utf-8\r\n";
+    response += "Content-Length: ";
+    response += std::to_string(body.size());
+    response += "\r\n";
+
+    response += "Connection: close\r\n";
+    response += "\r\n";
+    response.append(body.data(), body.size());
+
+    return response;
+}
+
+void prepareResponse(
+    ClientState& client,
+    int status,
+    std::string_view reason,
+    std::string_view body
+) {
+    client.output = makeHttpResponse(status, reason, body);
+    client.sent = 0;
+    client.response_ready = true;
+}
 
 void removeClient(
     int epoll_fd,
@@ -44,9 +86,10 @@ bool updateInterest(
     const ClientState& client
 ) {
     epoll_event event{};
+
     event.events = EPOLLRDHUP;
 
-    if (!client.read_closed) {
+    if (!client.read_closed && !client.response_ready) {
         event.events |= EPOLLIN;
     }
 
@@ -64,10 +107,56 @@ bool updateInterest(
     ) != -1;
 }
 
+void processHttpRequest(ClientState& client) {
+    const auto result =
+        cloudshield::http::parseHttpRequest(client.input);
+
+    using cloudshield::http::ParseStatus;
+
+    if (result.status == ParseStatus::BadRequest) {
+        prepareResponse(
+            client,
+            400,
+            "Bad Request",
+            "CloudShield: malformed HTTP request.\n"
+        );
+        return;
+    }
+
+    if (result.status == ParseStatus::Incomplete) {
+        // More TCP data may complete the request.
+        // If the client has closed its sending side,
+        // an incomplete request cannot be completed.
+        if (client.read_closed) {
+            prepareResponse(
+                client,
+                400,
+                "Bad Request",
+                "CloudShield: incomplete HTTP request.\n"
+            );
+        }
+
+        return;
+    }
+
+    if (result.status == ParseStatus::Complete) {
+        std::cout
+            << "HTTP request parsed: "
+            << result.request.method << " "
+            << result.request.target << '\n';
+
+        prepareResponse(
+            client,
+            200,
+            "OK",
+            "CloudShield HTTP request received.\n"
+        );
+    }
+}
+
 }  // namespace
 
 int runTcpServer() {
-    // Create a non-blocking TCP listening socket.
     int server_fd = socket(
         AF_INET,
         SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
@@ -80,7 +169,6 @@ int runTcpServer() {
         return 1;
     }
 
-    // Allow the port to be reused after the server stops.
     int reuse = 1;
 
     if (setsockopt(
@@ -119,7 +207,6 @@ int runTcpServer() {
         return 1;
     }
 
-    // Create the epoll instance.
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 
     if (epoll_fd == -1) {
@@ -129,7 +216,6 @@ int runTcpServer() {
         return 1;
     }
 
-    // Register the listening socket with epoll.
     epoll_event server_event{};
     server_event.events = EPOLLIN;
     server_event.data.fd = server_fd;
@@ -149,13 +235,13 @@ int runTcpServer() {
 
     std::unordered_map<int, ClientState> clients;
 
-    std::cout << "CloudShield TCP server listening on port "
+    std::cout << "CloudShield HTTP server listening on port "
               << PORT << '\n';
     std::cout << "Readiness monitoring: epoll\n";
     std::cout << "Input limit: "
               << MAX_INPUT_BYTES << " bytes per connection\n";
-    std::cout << "Output buffering: enabled\n";
-    std::cout << "Half-close handling: enabled\n";
+    std::cout << "HTTP parser integration: enabled\n";
+    std::cout << "Non-blocking I/O: enabled\n";
     std::cout << "Press Ctrl+C to stop.\n";
 
     epoll_event events[MAX_EVENTS];
@@ -179,10 +265,9 @@ int runTcpServer() {
         }
 
         for (int i = 0; i < count; ++i) {
-            int fd = events[i].data.fd;
-            std::uint32_t flags = events[i].events;
+            const int fd = events[i].data.fd;
+            const std::uint32_t flags = events[i].events;
 
-            // Handle new incoming connections.
             if (fd == server_fd) {
                 if (flags & (EPOLLERR | EPOLLHUP)) {
                     std::cerr << "Listening socket error\n";
@@ -193,7 +278,6 @@ int runTcpServer() {
                     continue;
                 }
 
-                // Accept connections until the socket would block.
                 while (true) {
                     sockaddr_in client_addr{};
                     socklen_t client_len = sizeof(client_addr);
@@ -265,12 +349,16 @@ int runTcpServer() {
             bool close_connection =
                 (flags & (EPOLLERR | EPOLLHUP)) != 0;
 
-            // Receive data until the socket would block or EOF occurs.
-            if (!close_connection && (flags & EPOLLIN)) {
+            // Read until EAGAIN, EOF, or an error.
+            // Also drain pending data on a half-close event.
+            if (!close_connection &&
+                !client.response_ready &&
+                (flags & (EPOLLIN | EPOLLRDHUP))) {
+
                 char buffer[1024];
 
                 while (true) {
-                    ssize_t received = recv(
+                    const ssize_t received = recv(
                         fd,
                         buffer,
                         sizeof(buffer),
@@ -281,24 +369,35 @@ int runTcpServer() {
                         const auto chunk_size =
                             static_cast<std::size_t>(received);
 
-                        // Correctly enforce the limit across all reads.
-                        if (client.received_bytes > MAX_INPUT_BYTES ||
+                        if (client.input.size() > MAX_INPUT_BYTES ||
                             chunk_size >
-                                MAX_INPUT_BYTES - client.received_bytes) {
-                            client.output =
-                                "CloudShield: input too large.\n";
-                            client.sent = 0;
-                            client.read_closed = true;
+                                MAX_INPUT_BYTES - client.input.size()) {
 
                             std::cerr
                                 << "Client exceeded input size limit\n";
+
+                            prepareResponse(
+                                client,
+                                413,
+                                "Content Too Large",
+                                "CloudShield: request too large.\n"
+                            );
+
                             break;
                         }
 
-                        client.received_bytes += chunk_size;
+                        client.input.append(
+                            buffer,
+                            chunk_size
+                        );
 
-                        std::cout << "Received " << received
-                                  << " bytes from client\n";
+                        // Parse after every received chunk.
+                        processHttpRequest(client);
+
+                        if (client.response_ready) {
+                            break;
+                        }
+
                         continue;
                     }
 
@@ -319,27 +418,30 @@ int runTcpServer() {
 
                     std::cerr << "recv() failed: "
                               << std::strerror(errno) << '\n';
+
                     close_connection = true;
                     break;
                 }
 
-                // Reply after the client finishes sending.
-                // Do not overwrite an oversized-input error response.
+                // Re-evaluate an incomplete request after EOF.
                 if (!close_connection &&
                     client.read_closed &&
-                    client.output.empty()) {
-                    client.output =
-                        "CloudShield TCP server received your message.\n";
-                    client.sent = 0;
+                    !client.response_ready) {
+
+                    if (client.input.empty()) {
+                        close_connection = true;
+                    } else {
+                        processHttpRequest(client);
+                    }
                 }
             }
 
-            // Send pending bytes, supporting partial writes.
+            // Support partial writes on non-blocking sockets.
             if (!close_connection &&
-                ((flags & EPOLLOUT) ||
-                 client.sent < client.output.size())) {
+                client.sent < client.output.size()) {
+
                 while (client.sent < client.output.size()) {
-                    ssize_t sent = send(
+                    const ssize_t sent = send(
                         fd,
                         client.output.data() + client.sent,
                         client.output.size() - client.sent,
@@ -364,19 +466,19 @@ int runTcpServer() {
 
                     std::cerr << "send() failed: "
                               << std::strerror(errno) << '\n';
+
                     close_connection = true;
                     break;
                 }
             }
 
-            // Close after all pending output has been sent.
+            // Every generated response uses Connection: close.
             if (!close_connection &&
-                client.read_closed &&
+                client.response_ready &&
                 client.sent == client.output.size()) {
                 close_connection = true;
             }
 
-            // Update epoll events for the client.
             if (!close_connection &&
                 !updateInterest(epoll_fd, fd, client)) {
                 std::cerr << "epoll_ctl(MOD) failed: "
@@ -399,5 +501,5 @@ shutdown:
     close(epoll_fd);
     close(server_fd);
 
-    return 1;
+    return 0;
 }
