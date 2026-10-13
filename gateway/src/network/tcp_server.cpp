@@ -1,4 +1,4 @@
-
+#include "http/http_response.hpp"
 #include "network/tcp_server.hpp"
 #include "http/http_request.hpp"
 
@@ -32,40 +32,21 @@ struct ClientState {
     bool response_ready = false;
 };
 
-std::string makeHttpResponse(
-    int status,
-    std::string_view reason,
-    std::string_view body
-) {
-    std::string response;
-
-    response.reserve(256 + body.size());
-
-    response += "HTTP/1.1 ";
-    response += std::to_string(status);
-    response += " ";
-    response += reason;
-    response += "\r\n";
-
-    response += "Content-Type: text/plain; charset=utf-8\r\n";
-    response += "Content-Length: ";
-    response += std::to_string(body.size());
-    response += "\r\n";
-
-    response += "Connection: close\r\n";
-    response += "\r\n";
-    response.append(body.data(), body.size());
-
-    return response;
-}
-
 void prepareResponse(
     ClientState& client,
     int status,
     std::string_view reason,
     std::string_view body
 ) {
-    client.output = makeHttpResponse(status, reason, body);
+    cloudshield::http::HttpResponse response;
+
+    response.status_code = status;
+    response.reason_phrase = std::string(reason);
+    response.body = std::string(body);
+
+    client.output =
+        cloudshield::http::serializeHttpResponse(response);
+
     client.sent = 0;
     client.response_ready = true;
 }
