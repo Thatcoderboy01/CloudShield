@@ -1,8 +1,8 @@
-
 #pragma once
 
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace cloudshield::http {
 
@@ -11,6 +11,7 @@ struct HttpResponse {
     std::string reason_phrase = "OK";
     std::string content_type = "text/plain; charset=utf-8";
     std::string body;
+    std::unordered_map<std::string, std::string> headers;
     std::string connection = "close";
 };
 

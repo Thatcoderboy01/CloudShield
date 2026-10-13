@@ -4,6 +4,8 @@ add_executable(cloudshield
     src/http/http_request.cpp
     src/http/http_response.cpp
     src/router/http_router.cpp
+    src/proxy/reverse_proxy.cpp
+    src/proxy/backend_response.cpp
 )
 
 target_include_directories(cloudshield
@@ -57,4 +59,19 @@ target_include_directories(http_router_test
 add_test(
     NAME HttpRouterTests
     COMMAND http_router_test
+)
+
+add_executable(backend_response_test
+    tests/unit/backend_response_test.cpp
+    src/proxy/backend_response.cpp
+)
+
+target_include_directories(backend_response_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(
+    NAME BackendResponseTests
+    COMMAND backend_response_test
 )

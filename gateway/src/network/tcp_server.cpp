@@ -17,6 +17,9 @@
 #include <netinet/in.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+
+
 namespace {
 
 constexpr int PORT = 8080;
@@ -31,6 +34,19 @@ struct ClientState {
     std::size_t sent = 0;
     bool read_closed = false;
     bool response_ready = false;
+};
+
+struct BackendState {
+    int fd = -1;
+
+    std::string request;
+    std::size_t sent = 0;
+
+    std::string response;
+
+    bool connecting = false;
+    bool request_sent = false;
+    bool response_complete = false;
 };
 
 void prepareResponse(
