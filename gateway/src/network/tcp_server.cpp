@@ -1,6 +1,7 @@
 #include "http/http_response.hpp"
 #include "network/tcp_server.hpp"
 #include "http/http_request.hpp"
+#include "router/http_router.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -105,9 +106,6 @@ void processHttpRequest(ClientState& client) {
     }
 
     if (result.status == ParseStatus::Incomplete) {
-        // More TCP data may complete the request.
-        // If the client has closed its sending side,
-        // an incomplete request cannot be completed.
         if (client.read_closed) {
             prepareResponse(
                 client,
@@ -126,12 +124,14 @@ void processHttpRequest(ClientState& client) {
             << result.request.method << " "
             << result.request.target << '\n';
 
-        prepareResponse(
-            client,
-            200,
-            "OK",
-            "CloudShield HTTP request received.\n"
-        );
+        const auto response =
+            cloudshield::router::routeRequest(result.request);
+
+        client.output =
+            cloudshield::http::serializeHttpResponse(response);
+
+        client.sent = 0;
+        client.response_ready = true;
     }
 }
 
