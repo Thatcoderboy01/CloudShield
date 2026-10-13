@@ -1,9 +1,17 @@
 name: CloudShield CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
 
     steps:
@@ -11,10 +19,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure CMake
-        run: cmake -S . -B build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 
-      - name: Build
-        run: cmake --build build --config Release
+      - name: Build CloudShield
+        run: cmake --build build --parallel 2
 
-      - name: Run CloudShield
-        run: ./build/gateway/cloudshield
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
